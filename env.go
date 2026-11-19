@@ -18,8 +18,11 @@ type Env struct {
 	ReadDir func(string) ([]fs.DirEntry, error)
 	// Spawn starts a detached `claude-dream work`. It must not wait for it.
 	Spawn func() error
-	// Extractor turns a queued job into memory changes.
+	// Extractor turns a queued job into memory changes; nil means the
+	// built-in extractor, which calls the model through LLM.
 	Extractor Extractor
+	// LLM sends one prompt to the model (claude -p, inert).
+	LLM LLM
 }
 
 func defaultEnv() Env {
@@ -28,15 +31,16 @@ func defaultEnv() Env {
 	if home != "" {
 		projects = filepath.Join(home, ".claude", "projects")
 	}
+	state := stateDirFor(os.Getenv("XDG_STATE_HOME"), home)
 	return Env{
-		StateDir:    stateDirFor(os.Getenv("XDG_STATE_HOME"), home),
+		StateDir:    state,
 		ProjectsDir: projects,
 		Home:        home,
 		Getenv:      os.Getenv,
 		Now:         time.Now,
 		ReadDir:     os.ReadDir,
 		Spawn:       spawnWorker,
-		Extractor:   noopExtractor{},
+		LLM:         claudeLLM{Dir: state},
 	}
 }
 
@@ -59,23 +63,39 @@ func (e Env) readDir(dir string) ([]fs.DirEntry, error) {
 	return e.ReadDir(dir)
 }
 
-// writeAtomic writes data to file through a temp file and a rename.
+// writeAtomic writes data to file through a temp file and a rename. It
+// keeps an existing file's mode (0644 for a new file) and leaves no temp
+// file behind on failure.
 func writeAtomic(file string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
 		return err
+	}
+	mode := fs.FileMode(0o644)
+	if st, err := os.Stat(file); err == nil {
+		mode = st.Mode().Perm()
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(file), ".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := tmp.Write(data); err != nil {
+	fail := func(err error) error {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		return fail(err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmp.Name())
 		return err
 	}
-	return os.Rename(tmp.Name(), file)
+	if err := os.Rename(tmp.Name(), file); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	return nil
 }

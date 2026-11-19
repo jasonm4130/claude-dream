@@ -16,6 +16,7 @@ import (
 
 type testEnv struct {
 	Env
+	llm    *fakeLLM
 	spawns int
 	state  string
 	proj   string
@@ -34,15 +35,43 @@ func newEnv(t *testing.T, vars map[string]string) *testEnv {
 	for k, v := range vars {
 		all[k] = v
 	}
+	te.llm = &fakeLLM{}
 	te.Env = Env{
 		StateDir: te.state, ProjectsDir: te.proj, Home: tmp,
-		ReadDir:   func(d string) ([]fs.DirEntry, error) { te.reads = append(te.reads, d); return os.ReadDir(d) },
-		Getenv:    func(k string) string { return all[k] },
-		Now:       func() time.Time { return time.Date(2026, 11, 19, 1, 2, 3, 0, time.UTC) },
+		ReadDir: func(d string) ([]fs.DirEntry, error) { te.reads = append(te.reads, d); return os.ReadDir(d) },
+		Getenv:  func(k string) string { return all[k] },
+		// Noon UTC is 2026-11-19 in every local time zone, so dates in
+		// file names are stable wherever the tests run.
+		Now:       func() time.Time { return time.Date(2026, 11, 19, 12, 2, 3, 0, time.UTC) },
 		Spawn:     func() error { te.spawns++; return nil },
 		Extractor: noopExtractor{},
+		LLM:       te.llm,
 	}
 	return te
+}
+
+// noopExtractor ignores every job; tests that exercise extraction set
+// Extractor to nil to get the built-in one.
+type noopExtractor struct{}
+
+func (noopExtractor) Extract(context.Context, Job) error { return nil }
+
+// fakeLLM returns canned answers in order, then "[]". It never runs claude.
+type fakeLLM struct {
+	answers []string
+	prompts []string
+	systems []string
+}
+
+func (f *fakeLLM) Run(_ context.Context, system, prompt string) (string, error) {
+	f.systems = append(f.systems, system)
+	f.prompts = append(f.prompts, prompt)
+	if len(f.answers) == 0 {
+		return "[]", nil
+	}
+	a := f.answers[0]
+	f.answers = f.answers[1:]
+	return a, nil
 }
 
 func runHook(t *testing.T, env Env, payload map[string]any) (int, string) {
@@ -103,7 +132,7 @@ func TestEnqueueAndSpawn(t *testing.T) {
 	}
 	var j Job
 	_ = json.Unmarshal([]byte(lines[0]), &j)
-	if j.SessionID != "s1" || j.Event != "PostCompact" || j.Trigger != "auto" || j.TS != "2026-11-19T01:02:03Z" || j.TranscriptPath != "/t/1.jsonl" {
+	if j.SessionID != "s1" || j.Event != "PostCompact" || j.Trigger != "auto" || j.TS != "2026-11-19T12:02:03Z" || j.TranscriptPath != "/t/1.jsonl" {
 		t.Fatalf("job = %+v", j)
 	}
 	_ = json.Unmarshal([]byte(lines[1]), &j)
@@ -128,54 +157,125 @@ func TestWorkerDrainsQueue(t *testing.T) {
 	if hasWork(te.state) {
 		t.Fatal("queue not drained")
 	}
-	if _, err := os.Stat(lockFile(te.state)); err == nil {
+	l := acquireLock(te.state, time.Now())
+	if l == nil {
 		t.Fatal("lock not released")
 	}
+	l.release()
 }
 
 func TestLock(t *testing.T) {
 	dir := t.TempDir()
-	if !acquireLock(dir) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	l := acquireLock(dir, now)
+	if l == nil {
 		t.Fatal("first acquire failed")
 	}
-	if acquireLock(dir) {
-		t.Fatal("second acquire succeeded while held by a live PID")
-	}
-	releaseLock(dir)
-	// Stale: a PID that is not running.
-	if err := os.WriteFile(lockFile(dir), []byte("999999999"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !acquireLock(dir) {
-		t.Fatal("stale lock not replaced")
+	if acquireLock(dir, now) != nil {
+		t.Fatal("second acquire succeeded while held")
 	}
 	b, _ := os.ReadFile(lockFile(dir))
-	if strings.TrimSpace(string(b)) != itoa(os.Getpid()) {
+	if f := strings.Fields(string(b)); len(f) != 2 || f[0] != itoa(os.Getpid()) || f[1] != "2026-11-19T12:00:00Z" {
 		t.Fatalf("lock holds %q", b)
 	}
-	// A held lock makes work() a no-op that leaves the queue alone.
+	// A held lock makes work() a no-op that leaves the queue alone, and a
+	// holder older than 30 minutes is logged, never stolen.
 	te := newEnv(t, nil)
-	te.StateDir = dir
+	te.StateDir, te.state = dir, dir
+	te.Now = func() time.Time { return now.Add(31 * time.Minute) }
 	_ = appendJob(dir, Job{SessionID: "x"})
 	rec := &recorder{}
 	te.Extractor = rec
 	if work(te.Env) != 0 || len(rec.got) != 0 || !hasWork(dir) {
 		t.Fatal("worker ran despite held lock")
 	}
+	if lg, _ := os.ReadFile(filepath.Join(dir, "worker.jsonl")); !strings.Contains(string(lg), `"event":"holder_stuck"`) {
+		t.Fatalf("stuck holder not logged: %s", lg)
+	}
+	// Only the holder releases; then the lock is free again.
+	l.release()
+	l.release() // twice is harmless
+	l2 := acquireLock(dir, now)
+	if l2 == nil {
+		t.Fatal("released lock not reacquired")
+	}
+	l2.release()
 }
+
+func TestDrainAdoptsOnlyDeadOrOwnClaims(t *testing.T) {
+	te := newEnv(t, nil)
+	rec := &recorder{}
+	te.Extractor = rec
+	_ = os.MkdirAll(te.state, 0o755)
+	write := func(name, id string) string {
+		p := filepath.Join(te.state, name)
+		b, _ := json.Marshal(Job{SessionID: id})
+		_ = os.WriteFile(p, append(b, '\n'), 0o644)
+		return p
+	}
+	live := write("queue.claimed-"+itoa(os.Getppid()), "live") // the test's parent: alive, not us
+	write("queue.claimed-999999999", "dead")
+	write("queue.claimed-"+itoa(os.Getpid()), "own")
+	work(te.Env)
+	var got []string
+	for _, j := range rec.got {
+		got = append(got, j.SessionID)
+	}
+	if strings.Join(got, ",") != "dead,own" && strings.Join(got, ",") != "own,dead" {
+		t.Fatalf("ran %v", got)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatal("a live worker's claim was touched")
+	}
+}
+
+func TestWorkerAgesOut(t *testing.T) {
+	te := newEnv(t, nil)
+	now := te.Now()
+	te.Now = func() time.Time { return now }
+	calls := 0
+	te.Extractor = extractorFunc(func(Job) error {
+		calls++
+		now = now.Add(20 * time.Minute) // each job takes 20 minutes of the clock
+		return nil
+	})
+	for _, id := range []string{"a", "b", "c", "d"} {
+		_ = appendJob(te.state, Job{SessionID: id})
+	}
+	work(te.Env)
+	if calls != 2 {
+		t.Fatalf("ran %d jobs, want 2 before the 30 minute limit", calls)
+	}
+	b, _ := os.ReadFile(queueFile(te.state))
+	if strings.Count(string(b), "\n") != 2 {
+		t.Fatalf("queue = %s", b)
+	}
+	if lg, _ := os.ReadFile(filepath.Join(te.state, "worker.jsonl")); !strings.Contains(string(lg), "aged_out") {
+		t.Fatal("age-out not logged")
+	}
+}
+
+type extractorFunc func(Job) error
+
+func (f extractorFunc) Extract(_ context.Context, j Job) error { return f(j) }
 
 func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 
 func TestClaudeCommandBuilder(t *testing.T) {
-	cmd := claudeCommand(context.Background(), Job{Cwd: "/w"}, "p")
-	if got := strings.Join(cmd.Args, " "); got != "claude -p --model haiku p" {
-		t.Fatalf("args = %q", got)
+	cmd := claudeCommand(context.Background(), "/w", "sys")
+	want := []string{"claude", "-p", "--model", "haiku", "--output-format", "json", "--tools", "",
+		"--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--system-prompt", "sys"}
+	if strings.Join(cmd.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %q", cmd.Args)
 	}
 	env := strings.Join(cmd.Env, "\n")
 	for _, want := range []string{"CLAUDE_DREAM_WORKER=1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"} {
 		if !strings.Contains(env, want) {
 			t.Errorf("env lacks %s", want)
 		}
+	}
+	if cmd.WaitDelay != 10*time.Second {
+		t.Errorf("WaitDelay = %v", cmd.WaitDelay)
 	}
 	if cmd.Dir != "/w" {
 		t.Errorf("dir = %q", cmd.Dir)
