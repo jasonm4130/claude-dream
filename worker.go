@@ -1,43 +1,21 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 )
 
-// Extractor turns one queued job into memory changes.
+// Extractor turns one queued job into memory changes. A nil Env.Extractor
+// means the built-in one, extractJob; tests replace it.
 type Extractor interface {
 	Extract(ctx context.Context, job Job) error
-}
-
-// noopExtractor is the phase 1 stub.
-//
-// TODO(phase 2): replace with an extractor that runs claudeCommand, reads the
-// session transcript with eachLine, and writes through memstore.go.
-type noopExtractor struct{}
-
-func (noopExtractor) Extract(context.Context, Job) error { return nil }
-
-// claudeCommand builds the headless extraction call. Phase 2 will run it;
-// nothing runs it yet. The environment stops the child's own hooks from
-// queueing more work and keeps it from writing auto memory itself.
-func claudeCommand(ctx context.Context, job Job, prompt string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "claude", "-p", "--model", "haiku", prompt)
-	cmd.Dir = job.Cwd
-	cmd.Env = append(os.Environ(),
-		"CLAUDE_DREAM_WORKER=1",
-		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",
-	)
-	return cmd
 }
 
 func lockFile(stateDir string) string { return filepath.Join(stateDir, "worker.lock") }
@@ -94,11 +72,15 @@ func work(env Env) int {
 		if !acquireLock(env.StateDir) {
 			return 0
 		}
-		drain(context.Background(), env)
+		capped := drain(context.Background(), env)
+		if !capped {
+			maybeDream(context.Background(), env)
+		}
 		releaseLock(env.StateDir)
 		// A job enqueued after the last drain but before the unlock would
-		// find the lock held and be stranded; look again.
-		if !hasWork(env.StateDir) {
+		// find the lock held and be stranded; look again. Capped jobs wait
+		// for tomorrow's budget.
+		if capped || !hasWork(env.StateDir) {
 			break
 		}
 	}
@@ -115,38 +97,50 @@ func hasWork(stateDir string) bool {
 
 // drain processes claimed leftovers from a crashed worker, then claims the
 // queue by renaming it, so a hook appending meanwhile starts a fresh file.
-func drain(ctx context.Context, env Env) {
+// It stops, and reports true, when the daily LLM cap is reached; the jobs
+// not yet done go back on the queue.
+func drain(ctx context.Context, env Env) (capped bool) {
 	for {
 		claimed, _ := filepath.Glob(filepath.Join(env.StateDir, "queue.claimed-*"))
 		if len(claimed) == 0 {
 			dst := filepath.Join(env.StateDir, "queue.claimed-"+strconv.Itoa(os.Getpid()))
 			if os.Rename(queueFile(env.StateDir), dst) != nil {
-				return
+				return false
 			}
 			claimed = []string{dst}
 		}
 		for _, f := range claimed {
-			processFile(ctx, env, f)
+			if processFile(ctx, env, f) {
+				capped = true
+			}
 			_ = os.Remove(f) // queue files, not memory: safe to drop once handled
+		}
+		if capped {
+			return true
 		}
 	}
 }
 
-func processFile(ctx context.Context, env Env, path string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer func() { _ = f.Close() }()
-	r := bufio.NewReaderSize(f, 1<<16)
-	for {
-		line, err := r.ReadBytes('\n')
+// processFile runs each job in a claimed queue file. Once the cap is hit,
+// that job and every later one are appended to the queue again.
+func processFile(ctx context.Context, env Env, path string) (capped bool) {
+	_ = eachLine(path, func(line []byte, _ int64) {
 		var job Job
-		if len(line) > 0 && json.Unmarshal(line, &job) == nil && env.Extractor != nil {
-			_ = env.Extractor.Extract(ctx, job) // one bad job must not stop the rest
-		}
-		if err != nil {
+		if json.Unmarshal(line, &job) != nil {
 			return
 		}
-	}
+		if !capped {
+			var err error
+			if env.Extractor != nil {
+				err = env.Extractor.Extract(ctx, job)
+			} else {
+				err = extractJob(ctx, env, job)
+			}
+			capped = errors.Is(err, errCapped) // one bad job must not stop the rest
+		}
+		if capped {
+			_ = appendJob(env.StateDir, job)
+		}
+	})
+	return capped
 }

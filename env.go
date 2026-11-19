@@ -18,8 +18,11 @@ type Env struct {
 	ReadDir func(string) ([]fs.DirEntry, error)
 	// Spawn starts a detached `claude-dream work`. It must not wait for it.
 	Spawn func() error
-	// Extractor turns a queued job into memory changes.
+	// Extractor turns a queued job into memory changes; nil means the
+	// built-in extractor, which calls the model through LLM.
 	Extractor Extractor
+	// LLM sends one prompt to the model (claude -p, inert).
+	LLM LLM
 }
 
 func defaultEnv() Env {
@@ -28,15 +31,16 @@ func defaultEnv() Env {
 	if home != "" {
 		projects = filepath.Join(home, ".claude", "projects")
 	}
+	state := stateDirFor(os.Getenv("XDG_STATE_HOME"), home)
 	return Env{
-		StateDir:    stateDirFor(os.Getenv("XDG_STATE_HOME"), home),
+		StateDir:    state,
 		ProjectsDir: projects,
 		Home:        home,
 		Getenv:      os.Getenv,
 		Now:         time.Now,
 		ReadDir:     os.ReadDir,
 		Spawn:       spawnWorker,
-		Extractor:   noopExtractor{},
+		LLM:         claudeLLM{Dir: state},
 	}
 }
 

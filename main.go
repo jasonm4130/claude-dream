@@ -4,12 +4,18 @@
 // dispatches on hook_event_name.
 //
 //   - PostCompact and SessionEnd: append a job to a queue and start a
-//     detached `claude-dream work` process. The hook never waits.
+//     detached `claude-dream work` process. The hook never waits. The worker
+//     extracts durable facts from the session's human turns and, once a day,
+//     runs the dream pass over the memory dirs (propose mode by default).
 //   - SessionStart, UserPromptSubmit and PostToolUse: track which repos a
 //     session is working on and inject each newly focused repo's auto-memory
 //     files as additionalContext, once. No LLM is involved.
 //
-// Any failure exits 0 with no output, so a bug here never blocks a session.
+// Subcommands: work, dream [--dry-run], report [--days N] and
+// extract --dry-run <transcript>.
+//
+// Any hook failure exits 0 with no output, so a bug here never blocks a
+// session.
 package main
 
 import (
@@ -48,9 +54,24 @@ func main() {
 			return
 		case "work":
 			os.Exit(work(defaultEnv()))
+		case "dream", "report", "extract":
+			os.Exit(subcommand(os.Args[1], os.Args[2:], os.Stdout, os.Stderr, defaultEnv()))
 		}
 	}
 	os.Exit(run(os.Stdin, os.Stdout, os.Stderr, defaultEnv()))
+}
+
+// subcommand runs the commands a person types: dream, report and extract.
+func subcommand(name string, args []string, stdout, stderr io.Writer, env Env) int {
+	switch name {
+	case "dream":
+		return dreamCmd(args, stdout, stderr, env)
+	case "report":
+		return reportCmd(args, stdout, stderr, env)
+	case "extract":
+		return extractCmd(args, stdout, stderr, env)
+	}
+	return 2
 }
 
 // run returns the process exit code, which is always 0: hooks fail open.

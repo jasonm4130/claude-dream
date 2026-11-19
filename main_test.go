@@ -16,6 +16,7 @@ import (
 
 type testEnv struct {
 	Env
+	llm    *fakeLLM
 	spawns int
 	state  string
 	proj   string
@@ -34,15 +35,43 @@ func newEnv(t *testing.T, vars map[string]string) *testEnv {
 	for k, v := range vars {
 		all[k] = v
 	}
+	te.llm = &fakeLLM{}
 	te.Env = Env{
 		StateDir: te.state, ProjectsDir: te.proj, Home: tmp,
-		ReadDir:   func(d string) ([]fs.DirEntry, error) { te.reads = append(te.reads, d); return os.ReadDir(d) },
-		Getenv:    func(k string) string { return all[k] },
-		Now:       func() time.Time { return time.Date(2026, 11, 19, 1, 2, 3, 0, time.UTC) },
+		ReadDir: func(d string) ([]fs.DirEntry, error) { te.reads = append(te.reads, d); return os.ReadDir(d) },
+		Getenv:  func(k string) string { return all[k] },
+		// Noon UTC is 2026-11-19 in every local time zone, so dates in
+		// file names are stable wherever the tests run.
+		Now:       func() time.Time { return time.Date(2026, 11, 19, 12, 2, 3, 0, time.UTC) },
 		Spawn:     func() error { te.spawns++; return nil },
 		Extractor: noopExtractor{},
+		LLM:       te.llm,
 	}
 	return te
+}
+
+// noopExtractor ignores every job; tests that exercise extraction set
+// Extractor to nil to get the built-in one.
+type noopExtractor struct{}
+
+func (noopExtractor) Extract(context.Context, Job) error { return nil }
+
+// fakeLLM returns canned answers in order, then "[]". It never runs claude.
+type fakeLLM struct {
+	answers []string
+	prompts []string
+	systems []string
+}
+
+func (f *fakeLLM) Run(_ context.Context, system, prompt string) (string, error) {
+	f.systems = append(f.systems, system)
+	f.prompts = append(f.prompts, prompt)
+	if len(f.answers) == 0 {
+		return "[]", nil
+	}
+	a := f.answers[0]
+	f.answers = f.answers[1:]
+	return a, nil
 }
 
 func runHook(t *testing.T, env Env, payload map[string]any) (int, string) {
@@ -103,7 +132,7 @@ func TestEnqueueAndSpawn(t *testing.T) {
 	}
 	var j Job
 	_ = json.Unmarshal([]byte(lines[0]), &j)
-	if j.SessionID != "s1" || j.Event != "PostCompact" || j.Trigger != "auto" || j.TS != "2026-11-19T01:02:03Z" || j.TranscriptPath != "/t/1.jsonl" {
+	if j.SessionID != "s1" || j.Event != "PostCompact" || j.Trigger != "auto" || j.TS != "2026-11-19T12:02:03Z" || j.TranscriptPath != "/t/1.jsonl" {
 		t.Fatalf("job = %+v", j)
 	}
 	_ = json.Unmarshal([]byte(lines[1]), &j)
@@ -167,9 +196,11 @@ func TestLock(t *testing.T) {
 func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
 
 func TestClaudeCommandBuilder(t *testing.T) {
-	cmd := claudeCommand(context.Background(), Job{Cwd: "/w"}, "p")
-	if got := strings.Join(cmd.Args, " "); got != "claude -p --model haiku p" {
-		t.Fatalf("args = %q", got)
+	cmd := claudeCommand(context.Background(), "/w", "sys")
+	want := []string{"claude", "-p", "--model", "haiku", "--output-format", "json", "--tools", "",
+		"--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence", "--system-prompt", "sys"}
+	if strings.Join(cmd.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %q", cmd.Args)
 	}
 	env := strings.Join(cmd.Env, "\n")
 	for _, want := range []string{"CLAUDE_DREAM_WORKER=1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"} {
