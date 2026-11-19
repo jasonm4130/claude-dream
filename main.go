@@ -5,8 +5,9 @@
 //
 //   - PostCompact and SessionEnd: append a job to a queue and start a
 //     detached `claude-dream work` process. The hook never waits.
-//   - SessionStart: inject the most relevant auto-memory files for the
-//     working directory as additionalContext. No LLM is involved.
+//   - SessionStart, UserPromptSubmit and PostToolUse: track which repos a
+//     session is working on and inject each newly focused repo's auto-memory
+//     files as additionalContext, once. No LLM is involved.
 //
 // Any failure exits 0 with no output, so a bug here never blocks a session.
 package main
@@ -33,6 +34,10 @@ type Payload struct {
 	HookEventName  string `json:"hook_event_name"`
 	Trigger        string `json:"trigger"` // PostCompact: manual|auto
 	Reason         string `json:"reason"`  // SessionEnd
+	Source         string `json:"source"`  // SessionStart: startup|resume|clear|compact|fork
+	Prompt         string `json:"prompt"`  // UserPromptSubmit
+	// ToolInput is the PostToolUse tool_input object, walked for repo paths.
+	ToolInput json.RawMessage `json:"tool_input"`
 }
 
 func main() {
@@ -65,7 +70,7 @@ func run(stdin io.Reader, stdout, _ io.Writer, env Env) (code int) {
 	switch p.HookEventName {
 	case "PostCompact", "SessionEnd":
 		enqueue(p, env)
-	case "SessionStart":
+	case "SessionStart", "UserPromptSubmit", "PostToolUse":
 		inject(p, stdout, env)
 	}
 	return 0

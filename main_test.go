@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,15 +19,25 @@ type testEnv struct {
 	spawns int
 	state  string
 	proj   string
+	root   string   // the one repo root; repos are directories under it
+	reads  []string // every directory the hooks listed
 }
 
 func newEnv(t *testing.T, vars map[string]string) *testEnv {
 	t.Helper()
-	root := t.TempDir()
-	te := &testEnv{state: filepath.Join(root, "cache", "claude-dream"), proj: filepath.Join(root, "projects")}
+	tmp := t.TempDir()
+	te := &testEnv{state: filepath.Join(tmp, "state", "claude-dream"), proj: filepath.Join(tmp, "projects"), root: filepath.Join(tmp, "Code")}
+	if err := os.MkdirAll(te.root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	all := map[string]string{"CLAUDE_DREAM_ROOTS": te.root}
+	for k, v := range vars {
+		all[k] = v
+	}
 	te.Env = Env{
-		StateDir: te.state, ProjectsDir: te.proj,
-		Getenv:    func(k string) string { return vars[k] },
+		StateDir: te.state, ProjectsDir: te.proj, Home: tmp,
+		ReadDir:   func(d string) ([]fs.DirEntry, error) { te.reads = append(te.reads, d); return os.ReadDir(d) },
+		Getenv:    func(k string) string { return all[k] },
 		Now:       func() time.Time { return time.Date(2026, 11, 19, 1, 2, 3, 0, time.UTC) },
 		Spawn:     func() error { te.spawns++; return nil },
 		Extractor: noopExtractor{},
@@ -47,28 +58,10 @@ func runHook(t *testing.T, env Env, payload map[string]any) (int, string) {
 
 const cwd = "/Users/x/Code/widget-shop"
 
-func writeMem(t *testing.T, te *testEnv, file, name, desc, body string) string {
-	t.Helper()
-	dir := filepath.Join(te.proj, projectDirName(cwd), "memory")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p := filepath.Join(dir, file)
-	data := "---\nname: " + name + "\ndescription: " + desc + "\nmetadata:\n  type: project\n---\n" + body + "\n"
-	if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-func start(id string) map[string]any {
-	return map[string]any{"hook_event_name": "SessionStart", "session_id": id, "cwd": cwd}
-}
-
 func TestGuardEnvVars(t *testing.T) {
 	for _, v := range []string{"CLAUDE_DREAM_WORKER", "CLAUDE_DREAM_OFF"} {
 		te := newEnv(t, map[string]string{v: "1"})
-		writeMem(t, te, "a.md", "widget-shop deploys", "widget-shop deploy notes", "body")
+		writeMem(t, te, "widget-shop", "a.md", "widget-shop deploys", "widget-shop deploy notes", "body")
 		for _, ev := range []string{"PostCompact", "SessionEnd", "SessionStart"} {
 			code, out := runHook(t, te.Env, map[string]any{"hook_event_name": ev, "session_id": "s", "cwd": cwd})
 			if code != 0 || out != "" {
@@ -189,108 +182,6 @@ func TestClaudeCommandBuilder(t *testing.T) {
 	}
 }
 
-func additional(t *testing.T, out string) string {
-	t.Helper()
-	var o struct {
-		H struct {
-			Name string `json:"hookEventName"`
-			Ctx  string `json:"additionalContext"`
-		} `json:"hookSpecificOutput"`
-	}
-	if err := json.Unmarshal([]byte(out), &o); err != nil || o.H.Name != "SessionStart" {
-		t.Fatalf("bad output %q: %v", out, err)
-	}
-	return o.H.Ctx
-}
-
-func TestInjectRankingAndLog(t *testing.T) {
-	te := newEnv(t, nil)
-	writeMem(t, te, "high.md", "widget-shop release", "How widget-shop ships", "Tag then push.")
-	writeMem(t, te, "mid.md", "shop notes", "Code layout for the shop", "Two path tokens only.")
-	writeMem(t, te, "none.md", "tea preferences", "Likes oolong", "Irrelevant.")
-	writeMem(t, te, "MEMORY.md", "widget-shop index", "widget-shop widget-shop", "index")
-	arch := filepath.Join(te.proj, projectDirName(cwd), "memory", ".archive")
-	_ = os.MkdirAll(arch, 0o755)
-	_ = os.WriteFile(filepath.Join(arch, "old.md"), []byte("---\nname: widget-shop old\ndescription: widget-shop\n---\nx"), 0o644)
-
-	_, out := runHook(t, te.Env, start("sess-1"))
-	ctx := additional(t, out)
-	if !strings.HasPrefix(ctx, injectHeader) {
-		t.Fatalf("no header: %q", ctx)
-	}
-	if !strings.Contains(ctx, "widget-shop release") || strings.Contains(ctx, "tea preferences") ||
-		strings.Contains(ctx, "index") || strings.Contains(ctx, "widget-shop old") {
-		t.Fatalf("wrong selection:\n%s", ctx)
-	}
-	b, _ := os.ReadFile(filepath.Join(te.state, "injections.jsonl"))
-	var rec struct {
-		TS       string   `json:"ts"`
-		Session  string   `json:"session_id"`
-		Memories []string `json:"memories"`
-	}
-	if err := json.Unmarshal(b, &rec); err != nil || rec.Session != "sess-1" || len(rec.Memories) == 0 || rec.Memories[0] != "widget-shop release" || rec.TS == "" {
-		t.Fatalf("log = %q (%v)", b, err)
-	}
-}
-
-func TestInjectBelowThresholdEmitsNothing(t *testing.T) {
-	te := newEnv(t, nil)
-	writeMem(t, te, "a.md", "tea preferences", "Likes oolong", "x")
-	writeMem(t, te, "b.md", "single token", "mentions widget only? no: Code", "x") // one path token = score 1
-	code, out := runHook(t, te.Env, start("s"))
-	if code != 0 || out != "" {
-		t.Fatalf("want silence, got %q", out)
-	}
-	if _, err := os.Stat(filepath.Join(te.state, "injections.jsonl")); err == nil {
-		t.Fatal("logged an injection that never happened")
-	}
-}
-
-func TestInjectScopedToCwdDir(t *testing.T) {
-	te := newEnv(t, nil)
-	other := filepath.Join(te.proj, projectDirName("/Users/x/Code/other"), "memory")
-	_ = os.MkdirAll(other, 0o755)
-	_ = os.WriteFile(filepath.Join(other, "a.md"), []byte("---\nname: widget-shop\ndescription: widget-shop\n---\nx"), 0o644)
-	if _, out := runHook(t, te.Env, start("s")); out != "" {
-		t.Fatalf("injected from another project: %q", out)
-	}
-}
-
-func TestInjectBudgetAndEnvOverride(t *testing.T) {
-	body := strings.Repeat("z", 1000)
-	fill := func(te *testEnv) {
-		for _, n := range []string{"a", "b", "c", "d", "e"} {
-			writeMem(t, te, n+".md", "widget-shop "+n, "widget-shop fact "+n, body)
-		}
-	}
-	count := func(ctx string) int { return strings.Count(ctx, "\n## ") }
-
-	te := newEnv(t, nil)
-	fill(te)
-	_, out := runHook(t, te.Env, start("s"))
-	ctx := additional(t, out)
-	if len(ctx) > defaultInjectChars || count(ctx) != 1 {
-		t.Fatalf("default: len %d, memories %d", len(ctx), count(ctx))
-	}
-
-	te = newEnv(t, map[string]string{"CLAUDE_DREAM_INJECT_CHARS": "5000"})
-	fill(te)
-	_, out = runHook(t, te.Env, start("s"))
-	ctx = additional(t, out)
-	if len(ctx) > 5000 || count(ctx) < 4 {
-		t.Fatalf("override: len %d, memories %d", len(ctx), count(ctx))
-	}
-
-	te = newEnv(t, map[string]string{"CLAUDE_DREAM_INJECT_CHARS": "999999"})
-	if injectBudget(te.Env) != maxInjectChars {
-		t.Fatalf("hard cap = %d", injectBudget(te.Env))
-	}
-	te = newEnv(t, map[string]string{"CLAUDE_DREAM_INJECT_CHARS": "junk"})
-	if injectBudget(te.Env) != defaultInjectChars {
-		t.Fatal("junk override should fall back")
-	}
-}
-
 func TestMemstoreConflictAndArchive(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "m.md")
@@ -346,8 +237,8 @@ func TestParseFrontmatter(t *testing.T) {
 
 func TestSupersedeKeepsBodyAndIsSkipped(t *testing.T) {
 	te := newEnv(t, nil)
-	p := writeMem(t, te, "old.md", "widget-shop release", "How widget-shop ships", "Original body.")
-	writeMem(t, te, "new.md", "widget-shop release v2", "How widget-shop ships now", "New body.")
+	p := writeMem(t, te, "widget-shop", "old.md", "widget-shop release", "How widget-shop ships", "Original body.")
+	writeMem(t, te, "widget-shop", "new.md", "widget-shop release v2", "How widget-shop ships now", "New body.")
 	before, _ := os.ReadFile(p)
 	now := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC)
 	if err := supersede(p, "widget-shop release v2", now); err != nil {
@@ -361,8 +252,8 @@ func TestSupersedeKeepsBodyAndIsSkipped(t *testing.T) {
 	if m.Body != parseMemory(string(before)).Body || m.Name != "widget-shop release" {
 		t.Fatal("body or other fields changed")
 	}
-	_, out := runHook(t, te.Env, start("s"))
-	ctx := additional(t, out)
+	_, out := runHook(t, te.Env, event("SessionStart", "s", te.root+"/widget-shop", nil))
+	ctx := additional(t, out, "SessionStart")
 	if strings.Contains(ctx, "Original body") || !strings.Contains(ctx, "New body") {
 		t.Fatalf("superseded memory injected or new one missing:\n%s", ctx)
 	}
@@ -370,7 +261,7 @@ func TestSupersedeKeepsBodyAndIsSkipped(t *testing.T) {
 
 func TestSupersedeRefusesChangedFile(t *testing.T) {
 	te := newEnv(t, nil)
-	p := writeMem(t, te, "old.md", "n", "d", "b")
+	p := writeMem(t, te, "widget-shop", "old.md", "n", "d", "b")
 	// Simulate a change between read and write by calling writeMemory with a stale mtime.
 	st, _ := os.Stat(p)
 	stale := st.ModTime().Add(-time.Hour)
@@ -379,59 +270,5 @@ func TestSupersedeRefusesChangedFile(t *testing.T) {
 	}
 	if err := supersede(filepath.Join(t.TempDir(), "missing.md"), "x", time.Now()); err == nil {
 		t.Fatal("expected error for missing file")
-	}
-}
-
-func readLog(t *testing.T, te *testEnv) []map[string]any {
-	t.Helper()
-	b, _ := os.ReadFile(filepath.Join(te.state, "injections.jsonl"))
-	var out []map[string]any
-	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
-		var m map[string]any
-		if json.Unmarshal([]byte(l), &m) == nil {
-			out = append(out, m)
-		}
-	}
-	return out
-}
-
-func TestABArms(t *testing.T) {
-	var onID, offID string
-	for i := 0; onID == "" || offID == ""; i++ {
-		id := "sess-" + itoa(i)
-		if abArm(id) == "on" && onID == "" {
-			onID = id
-		} else if abArm(id) == "off" && offID == "" {
-			offID = id
-		}
-	}
-	if abArm(onID) != "on" {
-		t.Fatal("arm not deterministic")
-	}
-	te := newEnv(t, map[string]string{"CLAUDE_DREAM_AB": "1"})
-	writeMem(t, te, "a.md", "widget-shop release", "How widget-shop ships", "Body.")
-	_, out := runHook(t, te.Env, start(onID))
-	if out == "" {
-		t.Fatal("on arm injected nothing")
-	}
-	_, out = runHook(t, te.Env, start(offID))
-	if out != "" {
-		t.Fatalf("off arm injected %q", out)
-	}
-	log := readLog(t, te)
-	if len(log) != 2 || log[0]["arm"] != "on" || log[1]["arm"] != "off" || log[0]["chars"].(float64) == 0 || log[1]["chars"].(float64) != 0 {
-		t.Fatalf("log = %v", log)
-	}
-	if log[1]["session_id"] != offID || log[0]["ts"] == "" {
-		t.Fatalf("log = %v", log)
-	}
-	// Default: always on, arm "on", whatever the session id.
-	te = newEnv(t, nil)
-	writeMem(t, te, "a.md", "widget-shop release", "How widget-shop ships", "Body.")
-	if _, out = runHook(t, te.Env, start(offID)); out == "" {
-		t.Fatal("default must always inject")
-	}
-	if l := readLog(t, te); len(l) != 1 || l[0]["arm"] != "on" {
-		t.Fatalf("log = %v", l)
 	}
 }
