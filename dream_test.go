@@ -37,7 +37,7 @@ func newDreamFixture(t *testing.T, vars map[string]string) *dreamFixture {
 	mk("deploy-flow-copy.md", "garden-api deploys go through the staging pipeline", "Same thing, older wording.")
 	mk("tag-format.md", "release tags look like gardenapi-vX.Y.Z", "Tags: gardenapi-v1.2.3. See `~/notes/*.md` and `~/Code/<repo>/x`.")
 	f.dir = filepath.Dir(f.files["seed-catalog.md"])
-	idx := "# Memory\n\n- [Seed catalog](seed-catalog.md) — catalog\n- [Deploy flow](deploy-flow.md) — deploys\n- [Gone](removed-long-ago.md) — was deleted by hand\n- [Site](https://example.com/a.md) — external\n"
+	idx := "# Memory\n\n- [Seed catalog](seed-catalog.md) — catalog\n- [Deploy flow](deploy-flow.md) — deploys\n- [Gone](removed-long-ago.md) — was deleted by hand\n- [Site](https://example.com/a.md) — external\n- [Abs](/srv/garden/notes.md) — absolute\n- [Home](~/elsewhere/notes.md) — home\n"
 	if err := os.WriteFile(filepath.Join(f.dir, "MEMORY.md"), []byte(idx), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestDreamApply(t *testing.T) {
 	}
 	idx, _ := os.ReadFile(filepath.Join(f.dir, "MEMORY.md"))
 	s := string(idx)
-	for _, want := range []string{"(tag-format.md)", "(deploy-flow-v2.md)", "https://example.com/a.md"} {
+	for _, want := range []string{"(tag-format.md)", "(deploy-flow-v2.md)", "https://example.com/a.md", "(/srv/garden/notes.md)", "(~/elsewhere/notes.md)"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("index lacks %s:\n%s", want, s)
 		}

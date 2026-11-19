@@ -309,11 +309,12 @@ func jaccard(a, b map[string]bool) float64 {
 	return float64(inter) / float64(len(a)+len(b)-inter)
 }
 
-// localLink returns the file a MEMORY.md link points at, or "" for URLs and
-// anchors.
+// localLink returns the file a MEMORY.md link points at, relative to the
+// memory dir, or "" for URLs, anchors and absolute or home paths.
 func localLink(target string) string {
-	if strings.Contains(target, "://") || strings.HasPrefix(target, "#") || strings.HasPrefix(target, "mailto:") {
-		return ""
+	if strings.Contains(target, "://") || strings.HasPrefix(target, "#") || strings.HasPrefix(target, "mailto:") ||
+		strings.HasPrefix(target, "/") || strings.HasPrefix(target, "~") || strings.HasPrefix(target, "$") {
+		return "" // only links relative to the memory dir are checked
 	}
 	target, _, _ = strings.Cut(target, "#")
 	if target == "" {
