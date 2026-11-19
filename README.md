@@ -26,14 +26,15 @@ Each event that injects or withholds is logged as JSONL in the state dir (`injec
 
 ## What extraction does
 
-When a session compacts or ends, the worker reads the transcript from where it last stopped. It keeps only **human turns**: user lines with `origin.kind == "human"`. Agent hand-backs, task notifications, peer messages, tool results, shell and slash-command echoes are not human turns. For transcripts written before `origin` existed, it falls back to text-only lines that are not meta and don't start with `<` or with hand-back wording. System reminders are stripped. The assistant's last words before each turn go along as context, but they are never evidence.
+When a session compacts or ends, the worker reads the transcript from where it last stopped. It keeps only **human turns**: user lines with `origin.kind == "human"`. Agent hand-backs, task notifications, peer messages, tool results, shell and slash-command echoes, and `[Request interrupted` lines are not human turns. Transcripts written before `origin` existed (versions before 2.1.300) fall back to text-only lines that are not meta and don't start with `<` or with hand-back wording. Headless transcripts (`entrypoint: "sdk-cli"`, from `claude -p` runs) are skipped, since their prompts are machine-written. System reminders and `<pasted_content>` blocks are stripped: pasted text is not the user's own words. The assistant's last words before each turn go along as context, but they are never evidence.
 
-Sessions with fewer than two new human turns are skipped. The turns go to Haiku in chunks of up to 24,000 characters, with the existing memories listed as `name | type | description`. The prompts are in [prompt.go](prompt.go). The model is told to prefer saving nothing and to return at most five items per chunk. Each item must quote the user word for word. The worker drops an item when:
+Sessions with fewer than two new human turns are skipped. The turns go to Haiku in chunks of up to 24,000 characters, with the existing memories listed as `name | type | description` (proposals awaiting review are listed too, marked `pending review`). The prompts are in [prompt.go](prompt.go). The model is told to prefer saving nothing and to return at most five items per chunk. Each item must quote the user word for word. The worker drops an item when:
 
 - the quote is shorter than 12 characters or isn't found in a human turn (case and whitespace are ignored);
 - the name isn't kebab-case of at most 60 characters, or the type is unknown;
 - an update names a memory that doesn't exist;
-- an add reuses a name that is taken.
+- an add reuses a name that is taken;
+- its description's words overlap (Jaccard ≥ 0.6) a live memory, a pending proposal or an item already accepted in this run (`duplicate`).
 
 The log records every drop by reason.
 
@@ -137,7 +138,7 @@ echo '{"hook_event_name":"SessionStart"}' | claude-dream; echo "exit $?"   # exi
 
 - **One binary for every event.** It dispatches on `hook_event_name` and ignores any event it doesn't handle.
 - **It never waits.** Hooks append one line to `queue.jsonl` and spawn `claude-dream work` in its own session.
-- **One worker at a time.** The worker holds `worker.lock` (its PID inside; a dead PID makes the lock stale) and drains the queue.
+- **One worker at a time.** The worker holds an `flock` on `worker.lock` for its lifetime (the kernel releases it if the process dies; the file holds its PID and start time for people). It adopts a leftover claimed queue file only if the PID that claimed it is dead. After 30 minutes it stops taking jobs and leaves the rest queued. A worker that finds the lock held exits; if the holder has run over 30 minutes it logs `holder_stuck` to `worker.jsonl` but never steals the lock.
 - **State** lives under `$XDG_STATE_HOME/claude-dream` (default `~/.local/state/claude-dream`) and is written atomically. It holds the queue, the lock, per-session focus files (pruned after 7 days), the injection log and `extract.jsonl`. It also holds per-session extraction offsets (`extract/`), the daily call count, dream reports (`dream/`) and `dream.last`. Deleting it is harmless apart from losing the logs, though extraction then reads old sessions again.
 - **Memory files are never deleted.** Superseding adds frontmatter fields; archiving moves a file to `.archive/`.
 

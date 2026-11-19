@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// maxNameTries bounds every loop that looks for a free file name.
+const maxNameTries = 50
+
 // ErrConflict means the file changed since it was read.
 var ErrConflict = errors.New("memory file changed since it was read")
 
@@ -117,8 +120,15 @@ func archiveMemory(path string) (string, error) {
 	}
 	dst := filepath.Join(dir, filepath.Base(path))
 	for i := 1; ; i++ {
-		if _, err := os.Lstat(dst); errors.Is(err, os.ErrNotExist) {
+		_, err := os.Lstat(dst)
+		if errors.Is(err, os.ErrNotExist) {
 			break
+		}
+		if err != nil {
+			return "", err // unreadable: never guess past it
+		}
+		if i > maxNameTries {
+			return "", errors.New("archive: no free name")
 		}
 		dst = filepath.Join(dir, fmt.Sprintf("%s.%d", filepath.Base(path), i))
 	}

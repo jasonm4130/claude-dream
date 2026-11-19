@@ -155,11 +155,12 @@ func dreamCmd(args []string, stdout, stderr io.Writer, env Env) int {
 			_, _ = fmt.Fprintln(stderr, "claude-dream: dream is off (CLAUDE_DREAM_DREAM=off)")
 			return 0
 		}
-		if !acquireLock(env.StateDir) {
+		lock := acquireLock(env.StateDir, env.Now())
+		if lock == nil {
 			_, _ = fmt.Fprintln(stderr, "claude-dream: the worker is running; try again later")
 			return 1
 		}
-		defer releaseLock(env.StateDir)
+		defer lock.release()
 	}
 	text, counts := dreamPass(context.Background(), env, *dry)
 	if *dry {
@@ -210,6 +211,10 @@ func extractCmd(args []string, stdout, stderr io.Writer, env Env) int {
 	if err != nil {
 		res.Error = err.Error()
 		return 1
+	}
+	if sc.Headless {
+		res.Skipped = "headless"
+		return 0
 	}
 	res.HumanTurns = len(sc.Turns)
 	if len(sc.Turns) < 2 {

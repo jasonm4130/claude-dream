@@ -56,3 +56,9 @@ Dry-run extraction (`claude-dream extract --dry-run <transcript>` subcommand, fa
 - **Proposals** are full memory files with two extra frontmatter lines, `proposed_action` and `proposed_target`, removed when promoted by hand.
 - **The model's names are looked up, never joined into a path:** an update target or a dream file must match a file in the dir listing.
 - **A capped job** goes back on the queue with every job after it, and the worker stops for the day (no dream either).
+- **Review follow-ups:**
+  - Headless transcripts (`entrypoint: "sdk-cli"`) are skipped, logged as `headless`.
+  - The no-`origin` fallback applies only to transcripts whose `version` is below 2.1.300.
+  - `[Request interrupted` lines and `<pasted_content>` blocks are never evidence.
+  - Pending proposals are shown to the model, and a candidate whose description overlaps a live memory, a proposal or an earlier item (Jaccard ≥ 0.6) is dropped as `duplicate`.
+  - The worker lock is an `flock` held for the worker's lifetime. Claimed queue files are adopted only from dead PIDs. A worker stops after 30 minutes, and a stuck holder is logged, never robbed of its lock.

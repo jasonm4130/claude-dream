@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -53,6 +54,8 @@ type transcriptLine struct {
 	IsMeta      bool   `json:"isMeta"`
 	IsSidechain bool   `json:"isSidechain"`
 	Cwd         string `json:"cwd"`
+	Entrypoint  string `json:"entrypoint"` // "sdk-cli" for headless claude -p runs
+	Version     string `json:"version"`    // Claude Code version that wrote the line
 	Origin      *struct {
 		Kind string `json:"kind"`
 	} `json:"origin"`
@@ -66,7 +69,15 @@ type contentBlock struct {
 	Text string `json:"text"`
 }
 
-var reminderRe = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+var (
+	reminderRe = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+	// Pasted text is not the user's own words, so it can't be evidence.
+	pastedRe = regexp.MustCompile(`(?s)<pasted_content\b[^>]*>.*?</pasted_content>`)
+)
+
+// originSince is the first Claude Code version known to write origin on
+// user lines; transcripts from it on never use the no-origin fallback.
+var originSince = [3]int{2, 1, 300}
 
 // contentText returns a message's text and whether it was text only (a
 // string, or an array of text blocks).
@@ -91,7 +102,39 @@ func contentText(raw json.RawMessage) (string, bool) {
 	return strings.Join(parts, "\n"), textOnly
 }
 
-func cleanTurn(s string) string { return strings.TrimSpace(reminderRe.ReplaceAllString(s, "")) }
+func cleanTurn(s string) string {
+	s = reminderRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(pastedRe.ReplaceAllString(s, ""))
+}
+
+// parseVersion reads "2.1.328" (ignoring any suffix); ok is false otherwise.
+func parseVersion(v string) (out [3]int, ok bool) {
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) != 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		j := 0
+		for j < len(p) && p[j] >= '0' && p[j] <= '9' {
+			j++
+		}
+		n, err := strconv.Atoi(p[:j])
+		if err != nil {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func versionLess(a, b [3]int) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
 
 // transcriptScan is what one pass over a transcript finds.
 type transcriptScan struct {
@@ -99,13 +142,17 @@ type transcriptScan struct {
 	Others    []string // every string in non-human messages; kept only on request
 	Cwd       string   // the first cwd seen
 	Size      int64    // bytes of complete lines
+	Headless  bool     // a user line has entrypoint sdk-cli: prompts are machine-written
 	sawOrigin bool
+	modern    bool // written by a version that always records origin
 }
 
 // scanTranscript finds the human turns. A human turn is a user line whose
-// origin.kind is "human". Transcripts from versions without origin fall back
-// to a heuristic, decided over the whole file: not meta, text only, and not
-// starting with "<" or with the wording of an agent hand-back.
+// origin.kind is "human". Only transcripts from versions before origin
+// existed fall back to a heuristic, decided over the whole file: not meta,
+// text only, and not starting with "<" or with the wording of an agent
+// hand-back. "[Request interrupted" lines are never human. A headless
+// transcript (entrypoint sdk-cli) is flagged; its caller skips it.
 func scanTranscript(path string, keepOthers bool) (transcriptScan, error) {
 	var sc transcriptScan
 	type cand struct {
@@ -125,6 +172,9 @@ func scanTranscript(path string, keepOthers bool) (transcriptScan, error) {
 		if sc.Cwd == "" && l.Cwd != "" {
 			sc.Cwd = l.Cwd
 		}
+		if v, ok := parseVersion(l.Version); ok && !versionLess(v, originSince) {
+			sc.modern = true
+		}
 		switch l.Type {
 		case "assistant":
 			var blocks []contentBlock
@@ -140,6 +190,9 @@ func scanTranscript(path string, keepOthers bool) (transcriptScan, error) {
 				}
 			}
 		case "user":
+			if l.Entrypoint == "sdk-cli" {
+				sc.Headless = true
+			}
 			text, textOnly := contentText(l.Message.Content)
 			c := cand{t: turn{Text: cleanTurn(text), Context: lastText, End: end}}
 			if keepOthers {
@@ -148,6 +201,9 @@ func scanTranscript(path string, keepOthers bool) (transcriptScan, error) {
 			if l.Origin != nil {
 				sc.sawOrigin = true
 				c.origin = l.Origin.Kind
+			}
+			if strings.HasPrefix(c.t.Text, "[Request interrupted") {
+				c.origin = "interrupted" // not "human", and not a fallback candidate
 			}
 			c.fallback = !l.IsMeta && textOnly && c.t.Text != "" &&
 				!strings.HasPrefix(c.t.Text, "<") &&
@@ -161,8 +217,8 @@ func scanTranscript(path string, keepOthers bool) (transcriptScan, error) {
 	})
 	for _, c := range cands {
 		human := c.origin == "human" && c.t.Text != ""
-		if !sc.sawOrigin {
-			human = c.fallback
+		if !sc.sawOrigin && !sc.modern {
+			human = c.fallback && c.origin == ""
 		}
 		if human {
 			sc.Turns = append(sc.Turns, c.t)

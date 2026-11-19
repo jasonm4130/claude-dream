@@ -62,12 +62,14 @@ type memIndex struct {
 	projDir, globDir string
 	projLabel        string
 	mems             map[string]map[string]Memory // dir -> file stem -> memory
+	pending          map[string]map[string]Memory // dir -> stem -> proposal awaiting review
+	accepted         []string                     // descriptions accepted this run
 	taken            map[string]bool              // dir/stem names used this run
 }
 
 func newMemIndex(env Env, projDir, globDir, projLabel string) *memIndex {
 	ix := &memIndex{projDir: projDir, globDir: globDir, projLabel: projLabel,
-		mems: map[string]map[string]Memory{}, taken: map[string]bool{}}
+		mems: map[string]map[string]Memory{}, pending: map[string]map[string]Memory{}, taken: map[string]bool{}}
 	for _, d := range []string{projDir, globDir} {
 		if d == "" || ix.mems[d] != nil {
 			continue
@@ -76,8 +78,38 @@ func newMemIndex(env Env, projDir, globDir, projLabel string) *memIndex {
 		for _, m := range loadMemories(env, d, nil) {
 			ix.mems[d][strings.TrimSuffix(filepath.Base(m.Path), ".md")] = m
 		}
+		ix.pending[d] = map[string]Memory{}
+		for _, m := range loadMemories(env, filepath.Join(d, ".proposed"), nil) {
+			stem := strings.TrimSuffix(filepath.Base(m.Path), ".md")
+			if len(stem) > len("2006-01-02-") {
+				stem = stem[len("2006-01-02-"):]
+			}
+			ix.pending[d][stem] = m
+		}
 	}
 	return ix
+}
+
+// duplicate reports whether desc overlaps (token Jaccard >= 0.6) a live
+// memory or pending proposal in any dir of the index, or a fact accepted
+// earlier in this run. The memory being replaced does not count.
+func (ix *memIndex) duplicate(desc, except string) bool {
+	words := tokens(desc)
+	for _, set := range []map[string]map[string]Memory{ix.mems, ix.pending} {
+		for _, mems := range set {
+			for _, m := range mems {
+				if m.Path != except && jaccard(words, tokens(m.Description)) >= dupJaccard {
+					return true
+				}
+			}
+		}
+	}
+	for _, d := range ix.accepted {
+		if jaccard(words, tokens(d)) >= dupJaccard {
+			return true
+		}
+	}
+	return false
 }
 
 func (ix *memIndex) dirFor(scope string) string {
@@ -115,7 +147,7 @@ func (ix *memIndex) prompt(turns []turn) string {
 	b.WriteString("EXISTING MEMORIES\n")
 	write := func(title, dir string) {
 		b.WriteString(title + ":\n")
-		if len(ix.mems[dir]) == 0 {
+		if len(ix.mems[dir])+len(ix.pending[dir]) == 0 {
 			b.WriteString("(none)\n")
 		}
 		stems := make([]string, 0, len(ix.mems[dir]))
@@ -126,6 +158,15 @@ func (ix *memIndex) prompt(turns []turn) string {
 		for _, stem := range stems {
 			m := ix.mems[dir][stem]
 			fmt.Fprintf(&b, "- %s | %s | %s\n", stem, m.Type, oneLine(m.Description))
+		}
+		stems = stems[:0]
+		for stem := range ix.pending[dir] {
+			stems = append(stems, stem)
+		}
+		sort.Strings(stems)
+		for _, stem := range stems {
+			m := ix.pending[dir][stem]
+			fmt.Fprintf(&b, "- %s | %s | %s | pending review\n", stem, m.Type, oneLine(m.Description))
 		}
 	}
 	if ix.projDir != "" && ix.projDir != ix.globDir {
@@ -225,13 +266,21 @@ func validate(it item, turns []turn, ix *memIndex) (candidate, string) {
 		if ix.exists(c.Dir, it.Name) {
 			return c, "name_collision"
 		}
+		if ix.duplicate(it.Description, "") {
+			return c, "duplicate"
+		}
 		ix.taken[c.Dir+"/"+it.Name] = true
+		ix.accepted = append(ix.accepted, it.Description)
 		return c, ""
 	}
 	// update or supersede: the target is looked up, never joined as a path.
 	for _, d := range []string{c.Dir, ix.projDir, ix.globDir} {
 		if m, ok := ix.mems[d][it.Target]; ok {
+			if ix.duplicate(it.Description, m.Path) {
+				return c, "duplicate"
+			}
 			c.Dir, c.TargetPath = d, m.Path
+			ix.accepted = append(ix.accepted, it.Description)
 			return c, ""
 		}
 	}
@@ -334,6 +383,10 @@ func extractJob(ctx context.Context, env Env, job Job) error {
 		lg.Error = err.Error()
 		return err
 	}
+	if sc.Headless {
+		lg.Skipped = "headless" // claude -p runs: their prompts are machine-written
+		return nil
+	}
 	if sc.Size < st.Offset {
 		st.Offset = 0 // a different or rewritten file
 	}
@@ -430,24 +483,35 @@ func memoryText(c candidate, stem, sessionID, date string, proposal bool) []byte
 }
 
 // newStem names the file for c: its own name for add, or the target's name
-// with the next free -vN suffix for update and supersede.
-func newStem(c candidate) string {
+// with the next free -vN suffix for update and supersede. It gives up on an
+// unreadable dir or after maxNameTries names.
+func newStem(c candidate) (string, error) {
 	if c.TargetPath == "" {
-		return c.Name
+		return c.Name, nil
 	}
 	base := versionRe.ReplaceAllString(strings.TrimSuffix(filepath.Base(c.TargetPath), ".md"), "")
-	for n := 2; ; n++ {
+	for n := 2; n < 2+maxNameTries; n++ {
 		stem := fmt.Sprintf("%s-v%d", base, n)
-		if _, err := os.Lstat(filepath.Join(c.Dir, stem+".md")); errors.Is(err, os.ErrNotExist) && !proposalExists(c.Dir, stem) {
-			return stem
+		_, err := os.Lstat(filepath.Join(c.Dir, stem+".md"))
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if !proposalExists(c.Dir, stem) {
+				return stem, nil
+			}
+		case err != nil:
+			return "", err
 		}
 	}
+	return "", errors.New("no free -vN name")
 }
 
 // place proposes or writes one candidate. It returns the file written, or
 // a drop reason. Writes refuse to replace any existing file.
 func place(env Env, md string, c candidate, sessionID, date string) (string, string) {
-	stem := newStem(c)
+	stem, err := newStem(c)
+	if err != nil {
+		return "", "no_free_name"
+	}
 	if md != "apply" {
 		path := filepath.Join(c.Dir, ".proposed", date+"-"+stem+".md")
 		if err := writeMemory(path, memoryText(c, stem, sessionID, date, true), time.Time{}); err != nil {

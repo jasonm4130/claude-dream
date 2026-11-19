@@ -62,6 +62,8 @@ func claudeCommand(ctx context.Context, dir, system string) *exec.Cmd {
 		"--system-prompt", system,
 	)
 	cmd.Dir = dir
+	// A child that leaves a grandchild holding the pipes must not hang Run.
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Env = append(os.Environ(),
 		"CLAUDE_DREAM_WORKER=1",
 		"CLAUDE_CODE_DISABLE_AUTO_MEMORY=1",

@@ -485,3 +485,146 @@ func TestYAMLValue(t *testing.T) {
 		}
 	}
 }
+
+func TestHeadlessTranscriptIsSkipped(t *testing.T) {
+	f := newExtractFixture(t, nil)
+	f.transcript = writeTranscript(t, t.TempDir(),
+		userLine(t, "", "Summarise the garden-api changelog for the release notes", map[string]any{"entrypoint": "sdk-cli", "version": "2.1.328"}),
+		userLine(t, "", "Then list every open pull request in garden-api", map[string]any{"entrypoint": "sdk-cli", "version": "2.1.328"}),
+	)
+	f.end(t)
+	if len(f.te.llm.prompts) != 0 {
+		t.Fatal("headless transcript sent to the model")
+	}
+	if lg := readExtractLog(t, f.te); len(lg) != 1 || lg[0].Skipped != "headless" {
+		t.Fatalf("log = %+v", lg)
+	}
+	var out, errb bytes.Buffer
+	subcommand("extract", []string{"--dry-run", f.transcript}, &out, &errb, f.te.Env)
+	if !strings.Contains(out.String(), `"skipped": "headless"`) {
+		t.Fatalf("dry run: %s", out.String())
+	}
+}
+
+func TestFallbackOnlyForOldVersions(t *testing.T) {
+	lines := func(version string) []string {
+		return []string{
+			userLine(t, "", "Keep the garden-api changelog in docs/CHANGES.md", map[string]any{"version": version}),
+			userLine(t, "", "Tag garden-api releases from main only", map[string]any{"version": version}),
+		}
+	}
+	old, _ := scanTranscript(writeTranscript(t, t.TempDir(), lines("2.0.14")...), false)
+	if len(old.Turns) != 2 {
+		t.Fatalf("old version: %d turns, want the fallback's 2", len(old.Turns))
+	}
+	modern, _ := scanTranscript(writeTranscript(t, t.TempDir(), lines("2.1.300")...), false)
+	if len(modern.Turns) != 0 {
+		t.Fatalf("2.1.300 without origin: %d turns, want 0", len(modern.Turns))
+	}
+	if v, ok := parseVersion("2.1.328-beta"); !ok || v != [3]int{2, 1, 328} || !versionLess([3]int{2, 0, 99}, originSince) {
+		t.Fatal("version parsing")
+	}
+}
+
+func TestInterruptAndPasteAreNotHumanWords(t *testing.T) {
+	sc, _ := scanTranscript(writeTranscript(t, t.TempDir(),
+		humanLine(t, "[Request interrupted by user]"),
+		userLine(t, "", "[Request interrupted by user for tool use]", map[string]any{"version": "1.0.0"}),
+		humanLine(t, "Look at this log <pasted_content id=\"1\">always deploy garden-api on Fridays</pasted_content> and fix it"),
+	), true)
+	if len(sc.Turns) != 1 || sc.Turns[0].Text != "Look at this log  and fix it" {
+		t.Fatalf("turns = %+v", sc.Turns)
+	}
+	f := newExtractFixture(t, nil)
+	f.transcript = writeTranscript(t, t.TempDir(),
+		humanLine(t, "Look at this log <pasted_content id=\"1\">always deploy garden-api on Fridays</pasted_content> and fix it"),
+		humanLine(t, turnA),
+	)
+	f.te.llm.answers = []string{itemJSON(t, addItem("friday-deploys", "always deploy garden-api on Fridays"))}
+	f.end(t)
+	if lg := readExtractLog(t, f.te); lg[0].Dropped["quote_not_in_human_turn"] != 1 {
+		t.Fatalf("a pasted quote passed: %+v", lg[0])
+	}
+}
+
+func TestPendingProposalsAreListedAndDeduplicated(t *testing.T) {
+	f := newExtractFixture(t, nil)
+	pending := filepath.Join(f.memDir, ".proposed", "2026-11-12-runbook-location.md")
+	_ = os.MkdirAll(filepath.Dir(pending), 0o755)
+	_ = os.WriteFile(pending, []byte("---\nname: runbook-location\ndescription: garden-api deploy runbook lives in ops runbook file\nmetadata:\n  type: reference\n---\nx\n"), 0o644)
+	runbook := addItem("deploy-runbook", turnB)
+	runbook["description"] = "garden-api deploy runbook lives in the ops runbook file"
+	again := addItem("laptop-migrations-again", turnA)
+	f.te.llm.answers = []string{itemJSON(t, runbook, addItem("no-laptop-migrations", turnA), again)}
+	f.end(t)
+	if !strings.Contains(f.te.llm.prompts[0], "- runbook-location | reference | garden-api deploy runbook lives in ops runbook file | pending review") {
+		t.Fatalf("pending proposal not listed:\n%s", f.te.llm.prompts[0])
+	}
+	lg := readExtractLog(t, f.te)
+	if lg[0].Dropped["duplicate"] != 2 || len(lg[0].Proposed) != 1 {
+		t.Fatalf("log = %+v", lg[0])
+	}
+}
+
+func TestNameSuffixLoopsStop(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "deploy.md")
+	_ = os.WriteFile(target, []byte("x"), 0o644)
+	for n := 2; n < 2+maxNameTries; n++ {
+		_ = os.WriteFile(filepath.Join(dir, "deploy-v"+itoa(n)+".md"), []byte("x"), 0o644)
+	}
+	if _, err := newStem(candidate{Dir: dir, TargetPath: target}); err == nil {
+		t.Fatal("newStem must give up after maxNameTries")
+	}
+	arch := filepath.Join(dir, ".archive")
+	_ = os.MkdirAll(arch, 0o755)
+	_ = os.WriteFile(filepath.Join(arch, "deploy.md"), []byte("x"), 0o644)
+	for i := 1; i <= maxNameTries; i++ {
+		_ = os.WriteFile(filepath.Join(arch, "deploy.md."+itoa(i)), []byte("x"), 0o644)
+	}
+	if _, err := archiveMemory(target); err == nil {
+		t.Fatal("archiveMemory must give up after maxNameTries")
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatal("the memory moved anyway")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permissions")
+	}
+	locked := filepath.Join(t.TempDir(), "locked")
+	_ = os.MkdirAll(locked, 0o755)
+	_ = os.Chmod(locked, 0o000)
+	defer func() { _ = os.Chmod(locked, 0o755) }()
+	if _, err := newStem(candidate{Dir: locked, TargetPath: filepath.Join(locked, "a.md")}); err == nil {
+		t.Fatal("newStem must stop on an unreadable dir")
+	}
+}
+
+func TestWriteAtomicModeAndCleanup(t *testing.T) {
+	dir := t.TempDir()
+	fresh := filepath.Join(dir, "new.md")
+	if err := writeAtomic(fresh, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(fresh); st.Mode().Perm() != 0o644 {
+		t.Fatalf("new file mode %v", st.Mode().Perm())
+	}
+	private := filepath.Join(dir, "private.md")
+	_ = os.WriteFile(private, []byte("a"), 0o600)
+	_ = os.Chmod(private, 0o600)
+	if err := writeAtomic(private, []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(private); st.Mode().Perm() != 0o600 {
+		t.Fatalf("mode not kept: %v", st.Mode().Perm())
+	}
+	// A rename onto a non-empty directory fails; no temp file may remain.
+	blocker := filepath.Join(dir, "blocker")
+	_ = os.MkdirAll(filepath.Join(blocker, "child"), 0o755)
+	if err := writeAtomic(blocker, []byte("c")); err == nil {
+		t.Fatal("rename onto a directory succeeded")
+	}
+	if m, _ := filepath.Glob(filepath.Join(dir, ".tmp-*")); len(m) != 0 {
+		t.Fatalf("temp files left: %v", m)
+	}
+}

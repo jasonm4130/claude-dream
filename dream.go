@@ -441,7 +441,10 @@ func validDreamItems(items []dreamItem, byFile map[string]Memory) []dreamItem {
 // source, then supersedes every source. No body is changed.
 func writeMerge(env Env, dir string, it dreamItem, byFile map[string]Memory, date string) (string, error) {
 	first := byFile[it.Files[0]]
-	stem := newStem(candidate{Dir: dir, TargetPath: first.Path})
+	stem, err := newStem(candidate{Dir: dir, TargetPath: first.Path})
+	if err != nil {
+		return "", err
+	}
 	desc := it.Description
 	if strings.TrimSpace(desc) == "" {
 		desc = first.Description
