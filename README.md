@@ -1,5 +1,7 @@
 # claude-dream
 
+> **Status: under review.** The injection and extraction hooks are proposed to be disabled by default; see [docs/adr/2026-11-20-retire-injection-and-extraction.md](docs/adr/2026-11-20-retire-injection-and-extraction.md).
+
 A [Claude Code](https://claude.com/claude-code) hook that tidies auto memory between sessions. It is a single Go binary with no dependencies. It reads the hook payload on stdin and always fails open.
 
 ## Phases
